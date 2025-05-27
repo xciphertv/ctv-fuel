@@ -6,13 +6,93 @@ local Core = exports[Config.CoreResource]:GetCoreObject()
 -- Station variables
 local StationPeds = {}
 local CurrentLocation = nil
-local StationFuelPrice = nil
-local StationBalance = nil
-local ReserveLevels = nil
+local StationFuelPrice = Config.CostMultiplier
+local StationBalance = 0
+local ReserveLevels = 0
 local ReservesNotBuyable = false
 local ReservePickupData = {}
 local FuelDeliveryVehicle = nil
 local FuelDeliveryTrailer = nil
+local GasStationZones = {}
+
+-- Update station information from server
+local function UpdateStationInfo(location, infoType)
+    if not Config.PlayerOwnedGasStationsEnabled or not location then
+        -- Set default values for non-owned stations
+        ReserveLevels = 1000
+        StationFuelPrice = Config.CostMultiplier
+        StationBalance = 0
+        return
+    end
+    
+    -- Always force a direct database lookup
+    local stationData = lib.callback.await('cdn-fuel:server:fetchStationInfo', false, location, "all", true)
+    
+    if stationData then
+        if Config.FuelDebug then
+            print("Station data received for location #" .. location .. ":")
+            print("  Fuel: " .. (stationData.fuel or "nil"))
+            print("  Fuel Price: " .. (stationData.fuelPrice or "nil"))
+            print("  Balance: " .. (stationData.balance or "nil"))
+        end
+        
+        -- Update all variables regardless of infoType parameter
+        ReserveLevels = stationData.fuel or 0
+        ReservesNotBuyable = (ReserveLevels or 0) >= Config.MaxFuelReserves
+        StationFuelPrice = stationData.fuelPrice or Config.CostMultiplier
+        StationBalance = stationData.balance or 0
+        
+        if Config.UnlimitedFuel then
+            ReservesNotBuyable = true
+        end
+    else
+        -- Set default values if fetch failed
+        ReserveLevels = 0
+        StationFuelPrice = Config.CostMultiplier
+        StationBalance = 0
+        
+        if Config.FuelDebug then
+            print("Failed to fetch station information for location:", location)
+        end
+    end
+end
+
+-- Function to refresh station data and reopen the menu
+local function refreshStationData(reopenMenu)
+    -- Update all station data
+    UpdateStationInfo(CurrentLocation)
+    
+    -- Reopen the management menu if requested
+    if reopenMenu then
+        Wait(100) -- Brief delay to ensure data is updated
+        TriggerEvent('cdn-fuel:stations:manageMenu')
+    end
+end
+
+-- Function to force refresh station data from database
+local function forceRefreshStationData()
+    if not CurrentLocation then return end
+    
+    -- Clear current values to show loading state
+    StationFuelPrice = nil
+    StationBalance = nil
+    ReserveLevels = nil
+    
+    -- Force database lookup and update
+    UpdateStationInfo(CurrentLocation, "all")
+    
+    -- Return current values after update
+    return {
+        fuelPrice = StationFuelPrice,
+        balance = StationBalance,
+        reserves = ReserveLevels
+    }
+end
+
+-- Event to refresh station data
+RegisterNetEvent('cdn-fuel:client:forceRefreshStationData', function()
+    forceRefreshStationData()
+end)
 
 -- Check if player owns the current station
 local function IsPlayerStationOwner(location)
@@ -37,8 +117,8 @@ local function UpdateStationInfo(location, infoType)
     
     if stationData then
         if infoType == "all" or infoType == "reserves" then
-            ReserveLevels = stationData.fuel
-            ReservesNotBuyable = ReserveLevels >= Config.MaxFuelReserves
+            ReserveLevels = stationData.fuel or 0
+            ReservesNotBuyable = (ReserveLevels or 0) >= Config.MaxFuelReserves
             
             if Config.UnlimitedFuel then
                 ReservesNotBuyable = true
@@ -46,13 +126,18 @@ local function UpdateStationInfo(location, infoType)
         end
         
         if infoType == "all" or infoType == "fuelprice" then
-            StationFuelPrice = stationData.fuelPrice
+            StationFuelPrice = stationData.fuelPrice or Config.CostMultiplier
         end
         
         if infoType == "all" or infoType == "balance" then
-            StationBalance = stationData.balance
+            StationBalance = stationData.balance or 0
         end
     else
+        -- Set default values if fetch failed
+        ReserveLevels = 0
+        StationFuelPrice = Config.CostMultiplier
+        StationBalance = 0
+        
         if Config.FuelDebug then
             print("Failed to fetch station information for location:", location)
         end
@@ -230,6 +315,14 @@ RegisterNetEvent('cdn-fuel:stations:purchaseReserves', function(data)
         
         -- Process purchase
         TriggerServerEvent('cdn-fuel:stations:server:buyReserves', location, amount)
+        
+        -- Wait for delivery or auto-completion
+        Wait(1000)
+        
+        -- Refresh data and reopen menu if not using the delivery system
+        if not Config.OwnersPickupFuel then
+            refreshStationData(true)
+        end
     end
 end)
 
@@ -283,12 +376,19 @@ RegisterNetEvent('cdn-fuel:stations:changeFuelPrice', function(data)
     
     -- Update price
     TriggerServerEvent('cdn-fuel:station:server:updateFuelPrice', newPrice, location)
+    TriggerClientEvent('cdn-fuel:client:forceRefreshStationData', src)
     
     lib.notify({
         title = 'Gas Station',
         description = 'Fuel price updated to $' .. newPrice,
         type = 'success'
     })
+    
+    -- Wait for server to process
+    Wait(500)
+    
+    -- Refresh data and reopen menu
+    refreshStationData(true)
 end)
 
 -- Manage station funds event
@@ -346,7 +446,7 @@ RegisterNetEvent('cdn-fuel:stations:withdrawFunds', function()
     -- Update station info
     UpdateStationInfo(CurrentLocation, "balance")
     
-    if StationBalance <= 0 then
+    if (StationBalance or 0) <= 0 then
         lib.notify({
             title = 'Gas Station',
             description = 'No funds to withdraw',
@@ -395,8 +495,16 @@ RegisterNetEvent('cdn-fuel:stations:withdrawFunds', function()
         return
     end
     
-    -- Process withdrawal
-    TriggerServerEvent('cdn-fuel:station:server:withdrawFunds', amount, CurrentLocation, StationBalance)
+    -- Process withdrawal as cash item
+    TriggerServerEvent('cdn-fuel:station:server:withdrawFunds', amount, CurrentLocation, StationBalance, true)
+    TriggerClientEvent('cdn-fuel:client:forceRefreshStationData', src)
+
+    
+    -- Wait for server to process
+    Wait(500)
+    
+    -- Refresh data and reopen menu
+    refreshStationData(true)
 end)
 
 -- Deposit funds event
@@ -406,7 +514,21 @@ RegisterNetEvent('cdn-fuel:stations:depositFunds', function()
     -- Update station info
     UpdateStationInfo(CurrentLocation, "balance")
     
-    local playerBank = Core.Functions.GetPlayerData().money['bank']
+    -- Check if player has cash item
+    local cash = 0
+    if Config.UseOxInventory then
+        -- For ox_inventory
+        local inventory = exports.ox_inventory:GetPlayerItems()
+        for _, item in pairs(inventory) do
+            if item.name == 'money' then
+                cash = item.count
+                break
+            end
+        end
+    else
+        -- For qb-inventory
+        cash = Core.Functions.GetPlayerData().items.money or 0
+    end
     
     -- Input dialog for deposit
     local input = lib.inputDialog('Deposit Funds', {
@@ -418,15 +540,15 @@ RegisterNetEvent('cdn-fuel:stations:depositFunds', function()
         },
         {
             type = 'input',
-            label = 'Your Bank Balance',
-            default = '$' .. playerBank,
+            label = 'Your Cash',
+            default = '$' .. cash,
             disabled = true
         },
         {
             type = 'number',
             label = 'Amount to Deposit',
             min = 1,
-            max = playerBank
+            max = cash
         }
     })
     
@@ -444,7 +566,7 @@ RegisterNetEvent('cdn-fuel:stations:depositFunds', function()
         return
     end
     
-    if amount > playerBank then
+    if amount > cash then
         lib.notify({
             title = 'Gas Station',
             description = 'Cannot deposit more than you have',
@@ -453,8 +575,39 @@ RegisterNetEvent('cdn-fuel:stations:depositFunds', function()
         return
     end
     
-    -- Process deposit
-    TriggerServerEvent('cdn-fuel:station:server:depositFunds', amount, CurrentLocation, StationBalance)
+    -- Process deposit as cash item
+    TriggerServerEvent('cdn-fuel:station:server:depositFunds', amount, CurrentLocation, StationBalance, true)
+    TriggerClientEvent('cdn-fuel:client:forceRefreshStationData', src)
+    
+    -- Wait for server to process
+    Wait(500)
+    
+    -- Refresh data and reopen menu
+    refreshStationData(true)
+end)
+
+-- Update station labels event
+RegisterNetEvent('cdn-fuel:client:updateStationLabels', function(location, newLabel)
+    if Config.FuelDebug then
+        print("Updating station label for location #" .. location .. " to: " .. newLabel)
+    end
+    
+    if Config.GasStations[location] then
+        Config.GasStations[location].label = newLabel
+        
+        if Config.FuelDebug then
+            print("Station label updated successfully")
+        end
+        
+        -- If this is our current location, force a refresh
+        if CurrentLocation == location then
+            forceRefreshStationData()
+        end
+    else
+        if Config.FuelDebug then
+            print("Failed to update station label - location not found in config")
+        end
+    end
 end)
 
 -- Change station name event
@@ -470,7 +623,7 @@ RegisterNetEvent('cdn-fuel:stations:changeName', function()
         return
     end
     
-    local currentName = Config.GasStations[CurrentLocation].label
+    local currentName = Config.GasStations[CurrentLocation] and Config.GasStations[CurrentLocation].label or "Unknown"
     
     -- Input dialog for name change
     local input = lib.inputDialog('Change Station Name', {
@@ -493,6 +646,16 @@ RegisterNetEvent('cdn-fuel:stations:changeName', function()
     
     local newName = input[2]
     
+    -- Skip if name is unchanged
+    if newName == currentName then
+        lib.notify({
+            title = 'Gas Station',
+            description = 'The name is unchanged',
+            type = 'info'
+        })
+        return
+    end
+    
     -- Validate name
     if #newName < Config.NameChangeMinChar then
         lib.notify({
@@ -512,27 +675,46 @@ RegisterNetEvent('cdn-fuel:stations:changeName', function()
         return
     end
     
-    -- Check for profanity
-    for badWord, _ in pairs(Config.ProfanityList) do
-        if string.find(string.lower(newName), string.lower(badWord)) then
-            lib.notify({
-                title = 'Gas Station',
-                description = 'Inappropriate station name',
-                type = 'error'
-            })
-            return
-        end
-    end
-    
     -- Update name
     TriggerServerEvent('cdn-fuel:station:server:updateLocationName', newName, CurrentLocation)
+    
+    -- Wait for server to process
+    Wait(1000)
+    
+    -- Refresh data
+    forceRefreshStationData()
+    
+    -- Reopen menu to show updated name
+    Wait(200)
+    TriggerEvent('cdn-fuel:stations:manageMenu')
 end)
 
 -- Sell station event
 RegisterNetEvent('cdn-fuel:stations:sellStation', function()
-    if not IsPlayerStationOwner(CurrentLocation) then return end
+    if not IsPlayerStationOwner(CurrentLocation) then 
+        lib.notify({
+            title = 'Gas Station',
+            description = 'You do not own this station',
+            type = 'error'
+        })
+        return 
+    end
     
-    local stationCost = Config.GasStations[CurrentLocation].cost
+    -- Get the station cost and calculate sell price
+    local stationCost = Config.GasStations[CurrentLocation] and Config.GasStations[CurrentLocation].cost or 0
+    if stationCost <= 0 then
+        if Config.FuelDebug then
+            print("Error: Invalid station cost for location #" .. CurrentLocation)
+        end
+        
+        lib.notify({
+            title = 'Gas Station',
+            description = 'Station pricing error',
+            type = 'error'
+        })
+        return
+    end
+    
     local tax = SharedUtils.GlobalTax(stationCost)
     local totalValue = stationCost + tax
     local sellPrice = math.floor(SharedUtils.PercentOf(Config.GasStationSellPercentage, totalValue))
@@ -547,8 +729,12 @@ RegisterNetEvent('cdn-fuel:stations:sellStation', function()
     
     if confirm ~= 'confirm' then return end
     
+    if Config.FuelDebug then
+        print("Attempting to sell station #" .. CurrentLocation .. " for $" .. sellPrice)
+    end
+    
     -- Process sale
-    TriggerServerEvent('cdn-fuel:server:sellStation', CurrentLocation)
+    TriggerServerEvent('cdn-fuel:server:sellStation', CurrentLocation, sellPrice)
 end)
 
 -- Toggle emergency shutoff event
@@ -596,7 +782,7 @@ RegisterNetEvent('cdn-fuel:stations:openMenu', function(location)
             icon = 'fas fa-cogs',
             onSelect = function()
                 TriggerEvent('cdn-fuel:stations:manageMenu')
-            }
+            end
         })
     end
     
@@ -608,7 +794,7 @@ RegisterNetEvent('cdn-fuel:stations:openMenu', function(location)
             icon = 'fas fa-shopping-cart',
             onSelect = function()
                 TriggerEvent('cdn-fuel:stations:purchaseMenu', location)
-            }
+            end
         })
     end
     
@@ -622,7 +808,7 @@ RegisterNetEvent('cdn-fuel:stations:openMenu', function(location)
             icon = 'fas fa-power-off',
             onSelect = function()
                 TriggerEvent('cdn-fuel:stations:toggleShutoff')
-            }
+            end
         })
     end
     
@@ -638,18 +824,34 @@ end)
 
 -- Station management menu
 RegisterNetEvent('cdn-fuel:stations:manageMenu', function()
-    if not IsPlayerStationOwner(CurrentLocation) then return end
+    if not IsPlayerStationOwner(CurrentLocation) then
+        lib.notify({
+            title = 'Gas Station',
+            description = 'You do not own this station',
+            type = 'error'
+        })
+        return
+    end
     
-    -- Update station info
+    -- Force data refresh from database
+    local freshData = forceRefreshStationData()
+
+    -- Update station info to get latest data
     UpdateStationInfo(CurrentLocation)
     
+    -- Ensure variables have values to avoid nil concatenation
+    local reserves = ReserveLevels or 0
+    local price = StationFuelPrice or Config.CostMultiplier
+    local balance = StationBalance or 0
+    
+    Wait(200)
     -- Create menu options
     local options = {
         {
             title = 'Fuel Reserves',
-            description = ReserveLevels .. ' / ' .. Config.MaxFuelReserves .. ' liters',
+            description = tostring(ReserveLevels) .. ' / ' .. tostring(Config.MaxFuelReserves) .. ' liters',
             icon = 'fas fa-oil-can',
-            disabled = true
+            disabled = Config.UnlimitedFuel,
         },
         {
             title = 'Purchase Fuel',
@@ -657,8 +859,8 @@ RegisterNetEvent('cdn-fuel:stations:manageMenu', function()
             icon = 'fas fa-truck-loading',
             onSelect = function()
                 TriggerEvent('cdn-fuel:stations:purchaseReserves', {location = CurrentLocation})
-            },
-            disabled = ReservesNotBuyable
+            end,
+            disabled = ReservesNotBuyable or Config.UnlimitedFuel,
         }
     }
     
@@ -666,45 +868,63 @@ RegisterNetEvent('cdn-fuel:stations:manageMenu', function()
     if Config.PlayerControlledFuelPrices then
         table.insert(options, {
             title = 'Change Fuel Price',
-            description = 'Current price: $' .. StationFuelPrice .. ' per liter',
+            description = 'Current price: $' .. tostring(price) .. ' per liter',
             icon = 'fas fa-tags',
             onSelect = function()
                 TriggerEvent('cdn-fuel:stations:changeFuelPrice', {location = CurrentLocation})
-            }
+            end
         })
     end
     
     -- Funds management
     table.insert(options, {
         title = 'Manage Funds',
-        description = 'Current balance: $' .. StationBalance,
+        description = 'Current balance: $' .. tostring(balance),
         icon = 'fas fa-money-bill',
         onSelect = function()
             TriggerEvent('cdn-fuel:stations:manageFunds')
-        }
+        end
     })
     
     -- Station name change (if enabled)
+    local stationLabel = Config.GasStations[CurrentLocation] and Config.GasStations[CurrentLocation].label or "Unknown"
     if Config.GasStationNameChanges then
         table.insert(options, {
             title = 'Change Station Name',
-            description = 'Current name: ' .. Config.GasStations[CurrentLocation].label,
+            description = 'Current name: ' .. stationLabel,
             icon = 'fas fa-pencil-alt',
             onSelect = function()
                 TriggerEvent('cdn-fuel:stations:changeName')
-            }
+            end
         })
     end
     
     -- Sell station option
+    local stationCost = Config.GasStations[CurrentLocation] and Config.GasStations[CurrentLocation].cost or 0
+    local sellPrice = math.floor(SharedUtils.PercentOf(Config.GasStationSellPercentage, stationCost))
     table.insert(options, {
         title = 'Sell Station',
-        description = 'Sell for $' .. math.floor(SharedUtils.PercentOf(Config.GasStationSellPercentage, Config.GasStations[CurrentLocation].cost)),
+        description = 'Sell for $' .. tostring(sellPrice),
         icon = 'fas fa-dollar-sign',
         onSelect = function()
             TriggerEvent('cdn-fuel:stations:sellStation')
-        }
+        end
     })
+    
+    -- Emergency shutoff option (if enabled)
+    if Config.EmergencyShutOff then
+        local shutOffState = lib.callback.await('cdn-fuel:server:checkShutoff', false, CurrentLocation)
+        local shutoffText = shutOffState and "Currently disabled" or "Currently enabled"
+        
+        table.insert(options, {
+            title = 'Emergency Shutoff',
+            description = 'Pumps: ' .. shutoffText,
+            icon = 'fas fa-power-off',
+            onSelect = function()
+                TriggerEvent('cdn-fuel:stations:toggleShutoff')
+            end
+        })
+    end
     
     -- Create and show menu
     lib.registerContext({
@@ -892,6 +1112,211 @@ CreateThread(function()
     end
 end)
 
+-- Initialize gas stations with ox_lib zones
+CreateThread(function()
+    for stationId, station in pairs(Config.GasStations) do
+        -- Convert the polygon points to the format ox_lib expects
+        local points = {}
+        for i, point in ipairs(station.zones) do
+            points[i] = vec3(point.x, point.y, (station.minz + station.maxz) / 2)
+        end
+        
+        -- Create the polygon zone
+        GasStationZones[stationId] = lib.zones.poly({
+            points = points,
+            thickness = station.maxz - station.minz,
+            debug = Config.ZoneDebug,
+            onEnter = function()
+                inGasStation = true
+                CurrentLocation = stationId
+                
+                if Config.PlayerOwnedGasStationsEnabled then
+                    TriggerEvent('cdn-fuel:stations:updateLocation', stationId)
+                end
+            end,
+            onExit = function()
+                inGasStation = false
+                
+                if Config.PlayerOwnedGasStationsEnabled then
+                    -- If we're selling our station, wait briefly before clearing location
+                    Wait(1000)
+                    TriggerEvent('cdn-fuel:stations:updateLocation', nil)
+                    CurrentLocation = nil
+                end
+            end
+        })
+    end
+end)
+
+-- Initialize air and water vehicle fueling zones
+CreateThread(function()
+    if not Config.AirAndWaterVehicleFueling or not Config.AirAndWaterVehicleFueling.enabled then
+        return
+    end
+    
+    -- Wait for airwater.lua to define the global functions
+    Wait(1000)
+    -- Make sure GasStationZones exists
+    if not GasStationZones then
+        GasStationZones = {}
+    end
+    
+    for locationId, location in pairs(Config.AirAndWaterVehicleFueling.locations) do
+        -- Create the polygon zone directly using the points from config
+        GasStationZones['air_water_' .. locationId] = lib.zones.poly({
+            points = location.zone.points,
+            thickness = location.zone.thickness,
+            debug = Config.ZoneDebug,
+            onEnter = function()
+                -- Handle entering fueling zone
+                if location.draw_text then
+                    lib.showTextUI(location.draw_text)
+                end
+                
+                -- Spawn prop when entering zone
+                exports[GetCurrentResourceName()]:SpawnAirWaterFuelingProp(locationId)
+            end,
+            onExit = function()
+                -- Handle exiting fueling zone
+                lib.hideTextUI()
+                
+                -- Check if we should despawn the prop
+                CreateThread(function()
+                    Wait(5000)
+                    if not exports[GetCurrentResourceName()]:IsAnyPlayerNearAirWaterFueling(locationId) then
+                        exports[GetCurrentResourceName()]:DespawnAirWaterFuelingProp(locationId)
+                    end
+                end)
+            end,
+            inside = function()
+                -- Handle interactions inside the zone
+                if IsControlJustPressed(0, Config.AirAndWaterVehicleFueling.refuel_button) then
+                    -- Trigger refueling for air/water vehicle
+                    TriggerEvent('cdn-fuel:client:airwater:startRefuel', locationId, location.type)
+                end
+            end
+        })
+    end
+end)
+
+-- Air/water vehicle refueling event
+RegisterNetEvent('cdn-fuel:client:airwater:startRefuel', function(locationId, vehicleType)
+    -- Get the current vehicle
+    local ped = PlayerPedId()
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    
+    if vehicle == 0 then
+        lib.notify({
+            title = 'Fuel System',
+            description = 'You must be in a ' .. (vehicleType == 'air' and 'aircraft' or 'boat'),
+            type = 'error'
+        })
+        return
+    end
+    
+    -- Check if it's the correct type of vehicle
+    local vehicleClass = GetVehicleClass(vehicle)
+    local isCorrectType = (vehicleType == 'air' and (vehicleClass == 15 or vehicleClass == 16)) or
+                          (vehicleType == 'water' and vehicleClass == 14)
+    
+    if not isCorrectType then
+        lib.notify({
+            title = 'Fuel System',
+            description = 'This is not a ' .. (vehicleType == 'air' and 'aircraft' or 'boat'),
+            type = 'error'
+        })
+        return
+    end
+    
+    -- Get current fuel level
+    local curFuel = Utils.GetFuel(vehicle)
+    
+    if curFuel >= 95 then
+        lib.notify({
+            title = 'Fuel System',
+            description = 'The tank is already full',
+            type = 'error'
+        })
+        return
+    end
+    
+    -- Calculate refueling details
+    local maxFuel = math.ceil(100 - curFuel)
+    local fuelPrice = vehicleType == 'air' and Config.AirAndWaterVehicleFueling.air_fuel_price or Config.AirAndWaterVehicleFueling.water_fuel_price
+
+    -- Show refueling menu
+    local input = lib.inputDialog('Refuel ' .. (vehicleType == 'air' and 'Aircraft' or 'Boat'), {
+        {
+            type = 'input',
+            label = 'Fuel Price',
+            default = '$' .. fuelPrice .. ' per liter',
+            disabled = true
+        },
+        {
+            type = 'input',
+            label = 'Current Fuel',
+            default = math.floor(curFuel) .. ' liters',
+            disabled = true
+        },
+        {
+            type = 'slider',
+            label = 'Amount to Refuel',
+            default = maxFuel,
+            min = 1,
+            max = maxFuel,
+            step = 1
+        },
+        {
+            type = 'select',
+            label = 'Payment Method',
+            options = {
+                { value = 'cash', label = 'Cash' },
+                { value = 'bank', label = 'Bank' }
+            }
+        }
+    })
+    
+    if not input then return end
+    
+    local amount = input[3]
+    local paymentType = input[4]
+    local finalCost = (amount * fuelPrice) + SharedUtils.GlobalTax(amount * fuelPrice)
+    
+    -- Process refueling
+    local success = lib.callback.await('cdn-fuel:server:payForFuel', false, finalCost, paymentType, fuelPrice)
+    
+    if success then
+        -- Start refueling animation/progress bar
+        lib.progressBar({
+            duration = amount * Config.RefuelTime,
+            label = 'Refueling ' .. (vehicleType == 'air' and 'Aircraft' or 'Boat'),
+            useWhileDead = false,
+            canCancel = true,
+            disable = {
+                car = true,
+                move = true
+            }
+        })
+        
+        -- Update vehicle fuel
+        local newFuel = curFuel + amount
+        if newFuel > 100 then newFuel = 100 end
+        Utils.SetFuel(vehicle, newFuel)
+        
+        lib.notify({
+            title = 'Fuel System',
+            description = 'Vehicle refueled successfully',
+            type = 'success'
+        })
+    else
+        lib.notify({
+            title = 'Fuel System',
+            description = 'Payment failed',
+            type = 'error'
+        })
+    end
+end)
+
 -- Resource cleanup
 AddEventHandler('onResourceStop', function(resource)
     if resource ~= GetCurrentResourceName() then return end
@@ -914,4 +1339,13 @@ AddEventHandler('onResourceStop', function(resource)
     if ReservePickupData.blip then
         RemoveBlip(ReservePickupData.blip)
     end
+    
+    -- Remove gas station zones - Fix this section
+    for id, zone in pairs(GasStationZones) do
+        if zone and zone.remove then
+            zone:remove()
+        end
+    end
+    
+    -- The air/water zones are now handled in airwater.lua's cleanup function
 end)

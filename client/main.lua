@@ -9,6 +9,8 @@ local holdingNozzle = false
 local refueling = false
 local CurrentLocation = nil
 local GasStationZones = {}
+local fuelNozzle = nil
+local Rope = nil
 
 -- Function to handle fuel consumption
 local function HandleFuelConsumption(vehicle)
@@ -27,6 +29,7 @@ local function HandleFuelConsumption(vehicle)
         Utils.SetFuel(vehicle, Utils.GetFuel(vehicle) - fuelUsage)
     end
 end
+
 
 -- Grab nozzle event handler
 RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
@@ -49,14 +52,14 @@ RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
     end
     
     -- Animation and sound
-    lib.requestAnimDict("anim@am_hold_up@male")
+    Utils.LoadAnimDict("anim@am_hold_up@male")
     TaskPlayAnim(ped, "anim@am_hold_up@male", "shoplift_high", 2.0, 8.0, -1, 50, 0, 0, 0, 0)
     TriggerServerEvent("InteractSound_SV:PlayOnSource", "pickupnozzle", 0.4)
     Wait(300)
     StopAnimTask(ped, "anim@am_hold_up@male", "shoplift_high", 1.0)
     
     -- Create nozzle object
-    local fuelNozzle = CreateObject(joaat('prop_cs_fuel_nozle'), 1.0, 1.0, 1.0, true, true, false)
+    fuelNozzle = CreateObject(joaat('prop_cs_fuel_nozle'), 1.0, 1.0, 1.0, true, true, false)
     local leftHand = GetPedBoneIndex(ped, 18905)
     AttachEntityToEntity(fuelNozzle, ped, leftHand, 0.13, 0.04, 0.01, -42.0, -115.0, -63.42, 0, 1, 0, 1, 0, 1)
     
@@ -67,12 +70,19 @@ RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
     if Config.PumpHose then
         local pumpCoords, pump = Utils.GetClosestPump(nozzlePosition)
         
+        if not pump or pump == 0 then
+            if Config.FuelDebug then
+                print("Failed to find a fuel pump nearby")
+            end
+            return
+        end
+        
         -- Load rope textures
         RopeLoadTextures()
         while not RopeAreTexturesLoaded() do Wait(0) end
         
         -- Create rope
-        local Rope = AddRope(
+        Rope = AddRope(
             pumpCoords.x, pumpCoords.y, pumpCoords.z,
             0.0, 0.0, 0.0,
             3.0, Config.RopeType['fuel'], 8.0,
@@ -84,7 +94,7 @@ RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
         Wait(100)
         
         local nozzlePos = GetOffsetFromEntityInWorldCoords(fuelNozzle, 0.0, -0.033, -0.195)
-        local pumpHeight = Config.GasStations[CurrentLocation].pumpheightadd or 2.1
+        local pumpHeight = Config.GasStations[CurrentLocation] and Config.GasStations[CurrentLocation].pumpheightadd or 2.1
         
         AttachEntitiesToRope(
             Rope, pump, fuelNozzle,
@@ -94,7 +104,7 @@ RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
         )
     end
     
-    -- Monitor nozzle distance
+    -- Monitor nozzle distance thread
     CreateThread(function()
         while holdingNozzle do
             local currentCoords = GetEntityCoords(ped)
@@ -102,7 +112,11 @@ RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
             
             if dist > 7.5 then
                 holdingNozzle = false
-                DeleteObject(fuelNozzle)
+                
+                if fuelNozzle and DoesEntityExist(fuelNozzle) then
+                    DeleteObject(fuelNozzle)
+                    fuelNozzle = nil
+                end
                 
                 lib.notify({
                     title = 'Fuel System',
@@ -110,9 +124,10 @@ RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
                     type = 'error'
                 })
                 
-                if Config.PumpHose then
+                if Config.PumpHose and Rope then
                     RopeUnloadTextures()
                     DeleteRope(Rope)
+                    Rope = nil
                 end
                 
                 if Config.FuelNozzleExplosion then
@@ -125,16 +140,22 @@ RegisterNetEvent('cdn-fuel:client:grabNozzle', function()
     end)
 end)
 
+
 -- Return nozzle event handler
 RegisterNetEvent('cdn-fuel:client:returnNozzle', function()
     holdingNozzle = false
     TriggerServerEvent("InteractSound_SV:PlayOnSource", "putbacknozzle", 0.4)
     Wait(250)
-    DeleteObject(fuelNozzle)
     
-    if Config.PumpHose then
+    if fuelNozzle and DoesEntityExist(fuelNozzle) then
+        DeleteObject(fuelNozzle)
+        fuelNozzle = nil
+    end
+    
+    if Config.PumpHose and Rope then
         RopeUnloadTextures()
         DeleteRope(Rope)
+        Rope = nil
     end
 end)
 
@@ -150,6 +171,21 @@ RegisterNetEvent('cdn-fuel:client:refuelMenu', function()
     end
     
     local vehicle = Utils.GetClosestVehicle()
+    
+    -- Check if vehicle is electric
+    local vehModel = GetEntityModel(vehicle)
+    local vehName = string.lower(GetDisplayNameFromVehicleModel(vehModel))
+    local isElectric = Config.ElectricVehicles[vehName] and Config.ElectricVehicles[vehName].isElectric
+    
+    if isElectric then
+        lib.notify({
+            title = 'Fuel System',
+            description = 'This is an electric vehicle. Use an electric charger.',
+            type = 'error'
+        })
+        return
+    end
+    
     local curFuel = Utils.GetFuel(vehicle)
     
     if curFuel >= 95 then
@@ -376,7 +412,20 @@ CreateThread(function()
             icon = 'fas fa-gas-pump',
             label = 'Refuel Vehicle',
             distance = 2.0,
-            canInteract = function()
+            canInteract = function(entity)
+                -- Get vehicle model name
+                local vehModel = GetEntityModel(entity)
+                local vehName = string.lower(GetDisplayNameFromVehicleModel(vehModel))
+                
+                -- First check if it's an electric vehicle
+                local isElectric = Config.ElectricVehicles[vehName] and Config.ElectricVehicles[vehName].isElectric
+                
+                -- If it's electric, we should not be able to use regular fuel pumps
+                if isElectric then
+                    return false
+                end
+                
+                -- Otherwise, proceed with normal checks
                 return holdingNozzle and not refueling and inGasStation
             end,
             onSelect = function()

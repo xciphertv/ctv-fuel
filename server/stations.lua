@@ -36,35 +36,34 @@ local function InitializeStations()
 end
 
 -- Fetch station information callback
-lib.callback.register('cdn-fuel:server:fetchStationInfo', function(source, location, infoType)
+lib.callback.register('cdn-fuel:server:fetchStationInfo', function(source, location, infoType, forceFresh)
     if not Config.PlayerOwnedGasStationsEnabled or not location then
         return nil
     end
     
+    -- Always use Sync when we need fresh data
+    local queryFunction = forceFresh and MySQL.Sync.fetchAll or MySQL.Async.fetchAll
     local result = MySQL.Sync.fetchAll('SELECT * FROM fuel_stations WHERE location = ?', {location})
     
     if not result or #result == 0 then
+        print("No station data found for location #" .. location)
         return nil
     end
     
     local stationData = result[1]
-    local returnData = {}
+    local returnData = {
+        fuel = stationData.fuel,
+        fuelPrice = stationData.fuelprice,
+        balance = stationData.balance,
+        owner = stationData.owner,
+        owned = stationData.owned
+    }
     
-    if infoType == "all" or infoType == "reserves" then
-        returnData.fuel = stationData.fuel
-    end
-    
-    if infoType == "all" or infoType == "fuelprice" then
-        returnData.fuelPrice = stationData.fuelprice
-    end
-    
-    if infoType == "all" or infoType == "balance" then
-        returnData.balance = stationData.balance
-    end
-    
-    if infoType == "all" or infoType == "owner" then
-        returnData.owner = stationData.owner
-        returnData.owned = stationData.owned
+    if Config.FuelDebug then
+        print("Fetched station data for location #" .. location .. ":")
+        print("  Fuel: " .. (returnData.fuel or "nil"))
+        print("  Fuel Price: " .. (returnData.fuelPrice or "nil"))
+        print("  Balance: " .. (returnData.balance or "nil"))
     end
     
     return returnData
@@ -124,6 +123,7 @@ lib.callback.register('cdn-fuel:server:checkShutoff', function(source, location)
 end)
 
 -- Buy station event
+-- Buy station event
 RegisterNetEvent('cdn-fuel:server:buyStation', function(location, citizenId)
     local src = source
     local Player = Core.Functions.GetPlayer(src)
@@ -132,8 +132,9 @@ RegisterNetEvent('cdn-fuel:server:buyStation', function(location, citizenId)
         return
     end
     
-    -- Check if station is already owned
-    local isOwned = lib.callback.await('cdn-fuel:server:locationPurchased', src, location)
+    -- Check if station is already owned - direct DB query
+    local isOwnedResult = MySQL.Sync.fetchAll('SELECT owned FROM fuel_stations WHERE location = ?', {location})
+    local isOwned = isOwnedResult and #isOwnedResult > 0 and isOwnedResult[1].owned == 1
     
     if isOwned then
         TriggerClientEvent('ox_lib:notify', src, {
@@ -146,7 +147,8 @@ RegisterNetEvent('cdn-fuel:server:buyStation', function(location, citizenId)
     
     -- Check if player already owns a station (if limited to one)
     if Config.OneStationPerPerson then
-        local ownsStation = lib.callback.await('cdn-fuel:server:doesPlayerOwnStation', src)
+        local ownsStationResult = MySQL.Sync.fetchAll('SELECT * FROM fuel_stations WHERE owner = ? AND owned = 1', {citizenId})
+        local ownsStation = ownsStationResult and #ownsStationResult > 0
         
         if ownsStation then
             TriggerClientEvent('ox_lib:notify', src, {
@@ -178,6 +180,10 @@ RegisterNetEvent('cdn-fuel:server:buyStation', function(location, citizenId)
     
     MySQL.Async.execute('UPDATE fuel_stations SET owned = 1, owner = ? WHERE location = ?', {citizenId, location})
     
+    if Config.FuelDebug then
+        print("Player " .. Player.PlayerData.citizenid .. " purchased gas station at location " .. location)
+    end
+    
     TriggerClientEvent('ox_lib:notify', src, {
         title = 'Gas Station',
         description = 'You now own this gas station',
@@ -189,18 +195,31 @@ RegisterNetEvent('cdn-fuel:server:buyStation', function(location, citizenId)
 end)
 
 -- Sell station event
-RegisterNetEvent('cdn-fuel:server:sellStation', function(location)
+RegisterNetEvent('cdn-fuel:server:sellStation', function(location, sellPrice)
     local src = source
     local Player = Core.Functions.GetPlayer(src)
     
     if not Player or not location then
+        print("Error: Invalid player or location data for station sale")
         return
     end
     
-    -- Check if player owns the station
-    local isOwner = lib.callback.await('cdn-fuel:server:isStationOwner', src, location)
+    if not sellPrice or sellPrice <= 0 then
+        print("Error: Invalid sell price for station sale")
+        TriggerClientEvent('ox_lib:notify', src, {
+            title = 'Gas Station',
+            description = 'Invalid sell price',
+            type = 'error'
+        })
+        return
+    end
     
-    if not isOwner then
+    -- Directly check ownership from database
+    local result = MySQL.Sync.fetchAll('SELECT * FROM fuel_stations WHERE location = ? AND owner = ? AND owned = 1', 
+                                  {location, Player.PlayerData.citizenid})
+    
+    if not result or #result == 0 then
+        print("Error: Player is not the owner of this station")
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
             description = 'You do not own this station',
@@ -209,25 +228,71 @@ RegisterNetEvent('cdn-fuel:server:sellStation', function(location)
         return
     end
     
-    -- Calculate sell price
-    local stationCost = Config.GasStations[location].cost
-    local tax = SharedUtils.GlobalTax(stationCost)
-    local totalValue = stationCost + tax
-    local sellPrice = SharedUtils.PercentOf(Config.GasStationSellPercentage, totalValue)
+    -- Begin transaction to sell the station
+    print("Processing sale of station #" .. location .. " for $" .. sellPrice .. " by " .. Player.PlayerData.citizenid)
     
-    -- Process sale
-    Player.Functions.AddMoney('bank', sellPrice, 'Gas Station Sale')
-    
-    MySQL.Async.execute('UPDATE fuel_stations SET owned = 0, owner = "0" WHERE location = ?', {location})
-    
-    TriggerClientEvent('ox_lib:notify', src, {
-        title = 'Gas Station',
-        description = 'You sold the gas station for $' .. sellPrice,
-        type = 'success'
-    })
-    
-    -- Update station labels for all players
-    TriggerClientEvent('cdn-fuel:client:updateStationLabels', -1, location, Config.GasStations[location].label)
+    -- First, update the station record
+    MySQL.Async.execute('UPDATE fuel_stations SET owned = 0, owner = ?, balance = 0, fuelprice = ? WHERE location = ?', 
+                      {'0', Config.CostMultiplier, location},
+        function(rowsChanged)
+            if rowsChanged and rowsChanged > 0 then
+                print("Successfully reset station #" .. location .. " (Rows changed: " .. rowsChanged .. ")")
+                
+                -- Add money to player as cash item
+                local success = false
+                
+                if Config.UseOxInventory then
+                    -- For ox_inventory
+                    success = exports.ox_inventory:AddItem(src, 'money', sellPrice)
+                else
+                    -- For qb-inventory
+                    success = Player.Functions.AddItem('money', sellPrice)
+                    if success then
+                        TriggerClientEvent('inventory:client:ItemBox', src, Core.Shared.Items['money'], "add")
+                    end
+                end
+                
+                if success then
+                    print("Successfully paid $" .. sellPrice .. " to " .. Player.PlayerData.citizenid .. " for station sale")
+                    
+                    TriggerClientEvent('ox_lib:notify', src, {
+                        title = 'Gas Station',
+                        description = 'You sold the gas station for $' .. sellPrice,
+                        type = 'success'
+                    })
+                    
+                    -- Reset the station label to default if needed
+                    local defaultLabel = "Gas Station " .. location
+                    if Config.GasStations[location] and Config.GasStations[location].originalLabel then
+                        defaultLabel = Config.GasStations[location].originalLabel
+                    end
+                    
+                    -- Update station labels for all players
+                    TriggerClientEvent('cdn-fuel:client:updateStationLabels', -1, location, defaultLabel)
+                else
+                    print("Error: Failed to add money to player for station sale - inventory might be full!")
+                    
+                    -- Try to revert the station ownership
+                    MySQL.Async.execute('UPDATE fuel_stations SET owned = 1, owner = ? WHERE location = ?', 
+                                      {Player.PlayerData.citizenid, location})
+                    
+                    TriggerClientEvent('ox_lib:notify', src, {
+                        title = 'Gas Station',
+                        description = 'Sale failed - inventory might be full',
+                        type = 'error'
+                    })
+                end
+            else
+                print("Failed to reset station #" .. location .. " (No rows changed)")
+                
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Failed to sell gas station',
+                    type = 'error'
+                })
+            end
+        end
+    )
 end)
 
 -- Toggle station shutoff
@@ -432,13 +497,16 @@ RegisterNetEvent('cdn-fuel:station:server:updateFuelPrice', function(newPrice, l
     local Player = Core.Functions.GetPlayer(src)
     
     if not Player or not location then
+        print("Error: Invalid player or location data")
         return
     end
     
-    -- Check if player owns the station
-    local isOwner = lib.callback.await('cdn-fuel:server:isStationOwner', src, location)
+    -- Directly check ownership from database
+    local result = MySQL.Sync.fetchAll('SELECT * FROM fuel_stations WHERE location = ? AND owner = ? AND owned = 1', 
+                                  {location, Player.PlayerData.citizenid})
     
-    if not isOwner then
+    if not result or #result == 0 then
+        print("Error: Player is not the owner of this station")
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
             description = 'You do not own this station',
@@ -449,6 +517,7 @@ RegisterNetEvent('cdn-fuel:station:server:updateFuelPrice', function(newPrice, l
     
     -- Validate price
     if newPrice < Config.MinimumFuelPrice or newPrice > Config.MaxFuelPrice then
+        print("Error: Invalid price range")
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
             description = 'Invalid price range',
@@ -457,18 +526,34 @@ RegisterNetEvent('cdn-fuel:station:server:updateFuelPrice', function(newPrice, l
         return
     end
     
-    -- Update price
-    MySQL.Async.execute('UPDATE fuel_stations SET fuelprice = ? WHERE location = ?', {newPrice, location})
+    -- Update price with logging
+    print("Attempting to update fuel price for location #" .. location .. " to $" .. newPrice)
     
-    TriggerClientEvent('ox_lib:notify', src, {
-        title = 'Gas Station',
-        description = 'Fuel price updated to $' .. newPrice,
-        type = 'success'
-    })
+    MySQL.Async.execute('UPDATE fuel_stations SET fuelprice = ? WHERE location = ?', {newPrice, location}, 
+        function(rowsChanged)
+            if rowsChanged and rowsChanged > 0 then
+                print("Successfully updated fuel price for location #" .. location .. " to $" .. newPrice .. " (Rows changed: " .. rowsChanged .. ")")
+                
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Fuel price updated to $' .. newPrice,
+                    type = 'success'
+                })
+            else
+                print("Failed to update fuel price for location #" .. location .. " (No rows changed)")
+                
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Failed to update fuel price',
+                    type = 'error'
+                })
+            end
+        end
+    )
 end)
 
 -- Station fund management - withdraw
-RegisterNetEvent('cdn-fuel:station:server:withdrawFunds', function(amount, location, currentBalance)
+RegisterNetEvent('cdn-fuel:station:server:withdrawFunds', function(amount, location, currentBalance, useCashItem)
     local src = source
     local Player = Core.Functions.GetPlayer(src)
     
@@ -477,9 +562,10 @@ RegisterNetEvent('cdn-fuel:station:server:withdrawFunds', function(amount, locat
     end
     
     -- Check if player owns the station
-    local isOwner = lib.callback.await('cdn-fuel:server:isStationOwner', src, location)
+    local isOwner = MySQL.Sync.fetchAll('SELECT * FROM fuel_stations WHERE location = ? AND owner = ? AND owned = 1', 
+                                  {location, Player.PlayerData.citizenid})
     
-    if not isOwner then
+    if not isOwner or #isOwner == 0 then
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
             description = 'You do not own this station',
@@ -488,40 +574,74 @@ RegisterNetEvent('cdn-fuel:station:server:withdrawFunds', function(amount, locat
         return
     end
     
-    -- Validate amount
-    if amount <= 0 then
+    -- Get current balance from database to ensure accuracy
+    local stationData = MySQL.Sync.fetchAll('SELECT balance FROM fuel_stations WHERE location = ?', {location})
+    local actualBalance = stationData[1].balance
+    
+    if amount <= 0 or amount > actualBalance then
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
-            description = 'Invalid withdrawal amount',
+            description = 'Invalid amount or insufficient station funds',
             type = 'error'
         })
         return
     end
     
-    if amount > currentBalance then
-        TriggerClientEvent('ox_lib:notify', src, {
-            title = 'Gas Station',
-            description = 'Insufficient station funds',
-            type = 'error'
-        })
-        return
-    end
-    
-    -- Update balance
-    MySQL.Async.execute('UPDATE fuel_stations SET balance = ? WHERE location = ?', {currentBalance - amount, location})
-    
-    -- Add money to player
-    Player.Functions.AddMoney('bank', amount, 'Gas Station Withdrawal')
-    
-    TriggerClientEvent('ox_lib:notify', src, {
-        title = 'Gas Station',
-        description = 'Withdrew $' .. amount,
-        type = 'success'
-    })
+    -- Update balance in database
+    MySQL.Async.execute('UPDATE fuel_stations SET balance = balance - ? WHERE location = ?', {amount, location}, 
+        function(rowsChanged)
+            if rowsChanged and rowsChanged > 0 then
+                -- Add money as cash item to player
+                if useCashItem then
+                    if Config.UseOxInventory then
+                        -- For ox_inventory
+                        local success = exports.ox_inventory:AddItem(src, 'money', amount)
+                        if not success then
+                            -- Revert the database change if inventory is full
+                            MySQL.Async.execute('UPDATE fuel_stations SET balance = balance + ? WHERE location = ?', {amount, location})
+                            
+                            TriggerClientEvent('ox_lib:notify', src, {
+                                title = 'Gas Station',
+                                description = 'Inventory is full - cannot withdraw cash',
+                                type = 'error'
+                            })
+                            return
+                        end
+                    else
+                        -- For qb-inventory
+                        Player.Functions.AddItem('money', amount)
+                        TriggerClientEvent('inventory:client:ItemBox', src, Core.Shared.Items['money'], "add")
+                    end
+                else
+                    -- Legacy method - add to bank
+                    Player.Functions.AddMoney('bank', amount, 'Gas Station Withdrawal')
+                end
+                
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Withdrew $' .. amount,
+                    type = 'success'
+                })
+                
+                -- Trigger refresh for client
+                TriggerClientEvent('cdn-fuel:client:forceRefreshStationData', src)
+                
+                if Config.FuelDebug then
+                    print("Player " .. Player.PlayerData.citizenid .. " withdrew $" .. amount .. " from station #" .. location)
+                end
+            else
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Failed to withdraw funds',
+                    type = 'error'
+                })
+            end
+        end
+    )
 end)
 
 -- Station fund management - deposit
-RegisterNetEvent('cdn-fuel:station:server:depositFunds', function(amount, location, currentBalance)
+RegisterNetEvent('cdn-fuel:station:server:depositFunds', function(amount, location, currentBalance, useCashItem)
     local src = source
     local Player = Core.Functions.GetPlayer(src)
     
@@ -530,9 +650,10 @@ RegisterNetEvent('cdn-fuel:station:server:depositFunds', function(amount, locati
     end
     
     -- Check if player owns the station
-    local isOwner = lib.callback.await('cdn-fuel:server:isStationOwner', src, location)
+    local isOwner = MySQL.Sync.fetchAll('SELECT * FROM fuel_stations WHERE location = ? AND owner = ? AND owned = 1', 
+                                  {location, Player.PlayerData.citizenid})
     
-    if not isOwner then
+    if not isOwner or #isOwner == 0 then
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
             description = 'You do not own this station',
@@ -551,27 +672,71 @@ RegisterNetEvent('cdn-fuel:station:server:depositFunds', function(amount, locati
         return
     end
     
-    -- Check if player can afford
-    if Player.PlayerData.money['bank'] < amount then
+    local success = false
+    
+    -- Remove cash from player
+    if useCashItem then
+        if Config.UseOxInventory then
+            -- For ox_inventory
+            success = exports.ox_inventory:RemoveItem(src, 'money', amount)
+        else
+            -- For qb-inventory
+            success = Player.Functions.RemoveItem('money', amount)
+            if success then
+                TriggerClientEvent('inventory:client:ItemBox', src, Core.Shared.Items['money'], "remove")
+            end
+        end
+    else
+        -- Legacy method - remove from bank
+        success = Player.Functions.RemoveMoney('bank', amount, 'Gas Station Deposit')
+    end
+    
+    if not success then
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
-            description = 'Insufficient funds in bank',
+            description = 'Insufficient funds',
             type = 'error'
         })
         return
     end
     
-    -- Remove money from player
-    Player.Functions.RemoveMoney('bank', amount, 'Gas Station Deposit')
-    
-    -- Update balance
-    MySQL.Async.execute('UPDATE fuel_stations SET balance = ? WHERE location = ?', {currentBalance + amount, location})
-    
-    TriggerClientEvent('ox_lib:notify', src, {
-        title = 'Gas Station',
-        description = 'Deposited $' .. amount,
-        type = 'success'
-    })
+    -- Update balance in database
+    MySQL.Async.execute('UPDATE fuel_stations SET balance = balance + ? WHERE location = ?', {amount, location}, 
+        function(rowsChanged)
+            if rowsChanged and rowsChanged > 0 then
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Deposited $' .. amount,
+                    type = 'success'
+                })
+                
+                -- Trigger refresh for client
+                TriggerClientEvent('cdn-fuel:client:forceRefreshStationData', src)
+                
+                if Config.FuelDebug then
+                    print("Player " .. Player.PlayerData.citizenid .. " deposited $" .. amount .. " to station #" .. location)
+                end
+            else
+                -- Refund money if database update failed
+                if useCashItem then
+                    if Config.UseOxInventory then
+                        exports.ox_inventory:AddItem(src, 'money', amount)
+                    else
+                        Player.Functions.AddItem('money', amount)
+                        TriggerClientEvent('inventory:client:ItemBox', src, Core.Shared.Items['money'], "add")
+                    end
+                else
+                    Player.Functions.AddMoney('bank', amount, 'Gas Station Deposit Refund')
+                end
+                
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Failed to deposit funds',
+                    type = 'error'
+                })
+            end
+        end
+    )
 end)
 
 -- Update station name
@@ -580,13 +745,16 @@ RegisterNetEvent('cdn-fuel:station:server:updateLocationName', function(newName,
     local Player = Core.Functions.GetPlayer(src)
     
     if not Player or not location then
+        print("Error: Invalid player or location data for name change")
         return
     end
     
-    -- Check if player owns the station
-    local isOwner = lib.callback.await('cdn-fuel:server:isStationOwner', src, location)
+    -- Directly check ownership from database
+    local result = MySQL.Sync.fetchAll('SELECT * FROM fuel_stations WHERE location = ? AND owner = ? AND owned = 1', 
+                                  {location, Player.PlayerData.citizenid})
     
-    if not isOwner then
+    if not result or #result == 0 then
+        print("Error: Player is not the owner of this station")
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
             description = 'You do not own this station',
@@ -597,6 +765,7 @@ RegisterNetEvent('cdn-fuel:station:server:updateLocationName', function(newName,
     
     -- Validate name length
     if #newName < Config.NameChangeMinChar or #newName > Config.NameChangeMaxChar then
+        print("Error: Invalid name length")
         TriggerClientEvent('ox_lib:notify', src, {
             title = 'Gas Station',
             description = 'Invalid name length',
@@ -606,29 +775,57 @@ RegisterNetEvent('cdn-fuel:station:server:updateLocationName', function(newName,
     end
     
     -- Check for profanity
+    local hasProfanity = false
     for badWord, _ in pairs(Config.ProfanityList) do
         if string.find(string.lower(newName), string.lower(badWord)) then
-            TriggerClientEvent('ox_lib:notify', src, {
-                title = 'Gas Station',
-                description = 'Inappropriate station name',
-                type = 'error'
-            })
-            return
+            hasProfanity = true
+            break
         end
     end
     
-    -- Update name
-    MySQL.Async.execute('UPDATE fuel_stations SET label = ? WHERE location = ?', {newName, location})
+    if hasProfanity then
+        print("Error: Inappropriate station name")
+        TriggerClientEvent('ox_lib:notify', src, {
+            title = 'Gas Station',
+            description = 'Inappropriate station name',
+            type = 'error'
+        })
+        return
+    end
     
-    -- Update station name for all players
-    Config.GasStations[location].label = newName
-    TriggerClientEvent('cdn-fuel:client:updateStationLabels', -1, location, newName)
+    -- Update name with detailed logging
+    print("Attempting to update station name for location #" .. location .. " to: " .. newName)
     
-    TriggerClientEvent('ox_lib:notify', src, {
-        title = 'Gas Station',
-        description = 'Station name updated',
-        type = 'success'
-    })
+    MySQL.Async.execute('UPDATE fuel_stations SET label = ? WHERE location = ?', {newName, location}, 
+        function(rowsChanged)
+            if rowsChanged and rowsChanged > 0 then
+                print("Successfully updated station name for location #" .. location .. " (Rows changed: " .. rowsChanged .. ")")
+                
+                -- Update config in memory
+                Config.GasStations[location].label = newName
+                
+                -- Notify all players of the change
+                TriggerClientEvent('cdn-fuel:client:updateStationLabels', -1, location, newName)
+                
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Station name updated',
+                    type = 'success'
+                })
+                
+                -- Trigger refresh for the client
+                TriggerClientEvent('cdn-fuel:client:forceRefreshStationData', src)
+            else
+                print("Failed to update station name for location #" .. location .. " (No rows changed)")
+                
+                TriggerClientEvent('ox_lib:notify', src, {
+                    title = 'Gas Station',
+                    description = 'Failed to update station name',
+                    type = 'error'
+                })
+            end
+        end
+    )
 end)
 
 -- Update location labels for all players

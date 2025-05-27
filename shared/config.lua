@@ -154,24 +154,22 @@ Config.EmergencyServicesDiscount = {
 -- Air and Water Vehicle Fueling
 Config.AirAndWaterVehicleFueling = {
     ['enabled'] = true,
-    ['refuel_button'] = 47,
+    ['refuel_button'] = 47, -- G key
     ['nozzle_length'] = 20.0,
     ['air_fuel_price'] = 10,
     ['water_fuel_price'] = 4,
+    ['interaction_type'] = 'target', -- 'textui', 'target', or 'both'
     ['locations'] = {
         -- MRPD Helipad
         [1] = {
-            ['PolyZone'] = {
-                ['coords'] = {
-                    vector2(439.96, -973.0),
-                    vector2(458.09, -973.04),
-                    vector2(458.26, -989.47),
-                    vector2(439.58, -989.94),
+            ['zone'] = {
+                ['points'] = {
+                    vec3(439.96, -973.0, 43.0),
+                    vec3(458.09, -973.04, 43.0),
+                    vec3(458.26, -989.47, 43.0),
+                    vec3(439.58, -989.94, 43.0)
                 },
-                ['minmax'] = {
-                    ['min'] = 40,
-                    ['max'] = 50.0
-                },
+                ['thickness'] = 10.0
             },
             ['draw_text'] = "[G] Refuel Helicopter",
             ['type'] = 'air',
@@ -184,7 +182,7 @@ Config.AirAndWaterVehicleFueling = {
             },
             ['prop'] = {
                 ['model'] = 'prop_gas_pump_1d',
-                ['coords'] = vector4(442.08, -977.15, 42.69, 269.52),
+                ['coords'] = vector4(455.38, -977.15, 42.69, 269.52),
             }
         },
         -- Add more locations as needed
@@ -265,5 +263,7 @@ Config.GasStations = {
 
 -- Profanity Filter
 Config.ProfanityList = {
-    -- List of prohibited words
+    "badword1",
+    "badword2",
+    -- add more as needed
 }

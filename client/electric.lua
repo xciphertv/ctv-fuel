@@ -13,6 +13,7 @@ local HoldingElectricNozzle = false
 local ElectricChargerZones = {}
 local ElectricNozzle = nil
 local ElectricRope = nil
+local SpawnedChargers = {}
 
 -- Helper functions
 function IsHoldingElectricNozzle()
@@ -152,12 +153,7 @@ end)
 
 -- Check if vehicle is electric
 local function IsVehicleElectric(vehicle)
-    if not vehicle or vehicle == 0 then return false end
-    
-    local vehModel = GetEntityModel(vehicle)
-    local vehName = string.lower(GetDisplayNameFromVehicleModel(vehModel))
-    
-    return Config.ElectricVehicles[vehName] and Config.ElectricVehicles[vehName].isElectric
+    return Utils.IsVehicleElectric(vehicle)
 end
 
 -- Electric charging menu event
@@ -182,7 +178,8 @@ RegisterNetEvent('cdn-fuel:client:electric:showMenu', function()
         return
     end
     
-    if not IsVehicleElectric(vehicle) then
+    -- Better check for electric vehicles
+    if not Utils.IsVehicleElectric(vehicle) then
         lib.notify({
             title = 'Electric Charger',
             description = 'This vehicle is not electric',
@@ -281,7 +278,7 @@ RegisterNetEvent('cdn-fuel:client:electric:showChargingMenu', function(paymentTy
                 end
             end
         end
-    }
+    end
     
     -- Calculate total cost
     local totalCost = (maxCharge * chargePrice) + SharedUtils.GlobalTax(maxCharge * chargePrice)
@@ -389,35 +386,143 @@ RegisterNetEvent('cdn-fuel:client:electric:showChargingMenu', function(paymentTy
     end
 end)
 
--- Spawn electric chargers
+-- Function to spawn an electric charger
+local function SpawnElectricCharger(location)
+    if not Config.ElectricChargerModel then return end
+    if not Config.GasStations[location] or not Config.GasStations[location].electricchargercoords then return end
+    if SpawnedChargers[location] then return end
+    
+    local coords = Config.GasStations[location].electricchargercoords
+    local heading = coords.w - 180
+    
+    -- Load charger model
+    local modelHash = joaat('electric_charger')
+    
+    RequestModel(modelHash)
+    
+    local timeout = 0
+    while not HasModelLoaded(modelHash) and timeout < 100 do
+        Wait(100)
+        timeout = timeout + 1
+    end
+    
+    if timeout >= 100 then
+        if Config.FuelDebug then
+            print("Failed to load electric charger model for location #" .. location)
+        end
+        return
+    end
+    
+    -- Create charger object
+    local charger = CreateObject(
+        modelHash,
+        coords.x, coords.y, coords.z,
+        false, true, true
+    )
+    
+    if Config.FuelDebug then
+        print("Created Electric Charger @ Location #" .. location)
+    end
+    
+    SetEntityHeading(charger, heading)
+    FreezeEntityPosition(charger, true)
+    SetEntityAsMissionEntity(charger, true, true)
+    
+    -- Store the spawned charger
+    SpawnedChargers[location] = charger
+    
+    -- Add the charger to the gas station's property for easy access
+    Config.GasStations[location].electriccharger = charger
+    
+    -- Remove model from memory when done
+    SetModelAsNoLongerNeeded(modelHash)
+    
+    return charger
+end
+
+-- Function to despawn an electric charger
+local function DespawnElectricCharger(location)
+    if not SpawnedChargers[location] then return end
+    
+    if Config.FuelDebug then
+        print("Despawning electric charger for location #" .. location)
+    end
+    
+    if DoesEntityExist(SpawnedChargers[location]) then
+        DeleteEntity(SpawnedChargers[location])
+    end
+    
+    SpawnedChargers[location] = nil
+    Config.GasStations[location].electriccharger = nil
+end
+
+-- Function to check if any player is in a gas station
+local function IsAnyPlayerNearCharger(location)
+    if not Config.GasStations[location] or not Config.GasStations[location].electricchargercoords then
+        return false
+    end
+    
+    local players = GetActivePlayers()
+    local coords = vector3(
+        Config.GasStations[location].electricchargercoords.x,
+        Config.GasStations[location].electricchargercoords.y,
+        Config.GasStations[location].electricchargercoords.z
+    )
+    
+    for _, playerId in ipairs(players) do
+        local playerPed = GetPlayerPed(playerId)
+        local playerCoords = GetEntityCoords(playerPed)
+        
+        if #(playerCoords - coords) < 30.0 then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Replace the Spawn electric chargers thread
 CreateThread(function()
     if not Config.ElectricChargerModel then return end
     
-    -- Load charger model
-    lib.requestModel('electric_charger')
+    -- Wait for resources to finish loading
+    Wait(2000)
     
+    -- We don't spawn the chargers immediately - they'll be spawned when players enter the area
     if Config.FuelDebug then
-        print("Electric Charger Model Loaded!")
+        print("Electric charger system initialized")
     end
-    
-    -- Spawn chargers at gas stations
-    for i = 1, #Config.GasStations do
-        if Config.GasStations[i].electricchargercoords then
-            local coords = Config.GasStations[i].electricchargercoords
-            local heading = coords.w - 180
-            
-            Config.GasStations[i].electriccharger = CreateObject(
-                'electric_charger',
-                coords.x, coords.y, coords.z,
-                false, true, true
-            )
-            
-            if Config.FuelDebug then
-                print("Created Electric Charger @ Location #" .. i)
+end)
+
+-- Monitor player positions for spawning/despawning chargers
+CreateThread(function()
+    while true do
+        Wait(5000) -- Check every 5 seconds
+        
+        local playerPed = PlayerPedId()
+        local playerCoords = GetEntityCoords(playerPed)
+        
+        -- Check each gas station
+        for i = 1, #Config.GasStations do
+            if Config.GasStations[i].electricchargercoords then
+                local chargerCoords = vector3(
+                    Config.GasStations[i].electricchargercoords.x,
+                    Config.GasStations[i].electricchargercoords.y,
+                    Config.GasStations[i].electricchargercoords.z
+                )
+                
+                local dist = #(playerCoords - chargerCoords)
+                
+                -- If player is close, spawn the charger if not already spawned
+                if dist < 50.0 and not SpawnedChargers[i] then
+                    SpawnElectricCharger(i)
+                -- If player is far and charger is spawned, check if any player is still nearby
+                elseif dist > 50.0 and SpawnedChargers[i] then
+                    if not IsAnyPlayerNearCharger(i) then
+                        DespawnElectricCharger(i)
+                    end
+                end
             end
-            
-            SetEntityHeading(Config.GasStations[i].electriccharger, heading)
-            FreezeEntityPosition(Config.GasStations[i].electriccharger, true)
         end
     end
 end)
@@ -457,12 +562,22 @@ CreateThread(function()
             name = 'charge_electric_vehicle',
             icon = 'fas fa-bolt',
             label = 'Charge Vehicle',
-            distance = 2.0,
-            canInteract = function()
-                local vehicle = Utils.GetClosestVehicle()
-                return HoldingElectricNozzle and 
-                       IsVehicleElectric(vehicle) and
-                       Utils.IsPlayerNearVehicle()
+            distance = 3.0,  -- Increased from 2.0 for better detection
+            canInteract = function(entity, distance, coords, name, bone)
+                -- More detailed debug info
+                if Config.FuelDebug then
+                    print("Electric charge target check:")
+                    print("- Holding nozzle: " .. tostring(HoldingElectricNozzle))
+                    print("- Vehicle model: " .. GetDisplayNameFromVehicleModel(GetEntityModel(entity)))
+                    print("- Is electric: " .. tostring(IsVehicleElectric(entity)))
+                    print("- Distance: " .. tostring(distance))
+                end
+                
+                -- Simpler condition for better reliability
+                if not HoldingElectricNozzle then return false end
+                if not IsVehicleElectric(entity) then return false end
+                
+                return true
             end,
             onSelect = function()
                 TriggerEvent('cdn-fuel:client:electric:showMenu')
@@ -476,9 +591,9 @@ AddEventHandler('onResourceStop', function(resource)
     if resource ~= GetCurrentResourceName() then return end
     
     -- Remove electric chargers
-    for i = 1, #Config.GasStations do
-        if Config.GasStations[i].electriccharger then
-            DeleteEntity(Config.GasStations[i].electriccharger)
+    for location, charger in pairs(SpawnedChargers) do
+        if DoesEntityExist(charger) then
+            DeleteEntity(charger)
         end
     end
     

@@ -1,6 +1,15 @@
 local Core = exports[Config.CoreResource]:GetCoreObject()
 local Utils = {}
 
+function Utils.LoadAnimDict(dict)
+    if not HasAnimDictLoaded(dict) then
+        RequestAnimDict(dict)
+        while not HasAnimDictLoaded(dict) do
+            Wait(10)
+        end
+    end
+end
+
 -- Vehicle-related utilities
 function Utils.GetFuel(vehicle)
     return DecorGetFloat(vehicle, Config.FuelDecor)
@@ -11,6 +20,65 @@ function Utils.SetFuel(vehicle, fuel)
         SetVehicleFuelLevel(vehicle, fuel + 0.0)
         DecorSetFloat(vehicle, Config.FuelDecor, GetVehicleFuelLevel(vehicle))
     end
+end
+
+function Utils.IsVehicleElectric(vehicle)
+    if not vehicle or vehicle == 0 then return false end
+    
+    local vehModel = GetEntityModel(vehicle)
+    local vehName = string.lower(GetDisplayNameFromVehicleModel(vehModel))
+    
+    return Config.ElectricVehicles[vehName] and Config.ElectricVehicles[vehName].isElectric
+end
+
+function Utils.GetClosestPump(coords, isElectric)
+    local ped = PlayerPedId()
+    local pumpModels = isElectric and {'electric_charger'} or Config.FuelPumpModels
+    local closest = 1000.0
+    local closestPump = nil
+    local coordsToUse = coords or GetEntityCoords(ped)
+    
+    -- Get all objects in the area
+    local objects = GetGamePool('CObject')
+    
+    for _, object in ipairs(objects) do
+        local objModel = GetEntityModel(object)
+        
+        -- Check if the object is a fuel pump or electric charger
+        for _, model in ipairs(pumpModels) do
+            local modelHash = type(model) == 'string' and joaat(model) or model
+            
+            if objModel == modelHash then
+                local pumpCoords = GetEntityCoords(object)
+                local dist = #(coordsToUse - pumpCoords)
+                
+                if dist < closest then
+                    closest = dist
+                    closestPump = object
+                end
+            end
+        end
+    end
+    
+    if Config.FuelDebug and not closestPump then
+        print((isElectric and "No electric charger" or "No fuel pump") .. " found nearby")
+    end
+    
+    -- Return the coordinates and the entity
+    return closestPump and GetEntityCoords(closestPump) or vector3(0, 0, 0), closestPump or 0
+end
+
+function Utils.IsPlayerNearVehicle()
+    local ped = PlayerPedId()
+    local coords = GetEntityCoords(ped)
+    local vehicle = Utils.GetClosestVehicle(coords)
+    
+    if not vehicle or vehicle == 0 then return false end
+    
+    local vehicleCoords = GetEntityCoords(vehicle)
+    local dist = #(coords - vehicleCoords)
+    
+    return dist < 2.5
 end
 
 function Utils.GetClosestVehicle(coords)
